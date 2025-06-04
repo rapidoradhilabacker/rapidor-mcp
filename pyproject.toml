@@ -1,0 +1,13 @@
+[project]
+name = "rapidor-mcp-client-python"
+version = "0.1.0"
+description = "Rapidor MCP Client"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp",
+    "psycopg2-binary",
+    "python-dotenv",
+    "streamlit",
+    "openai",
+]
