@@ -232,6 +232,31 @@ def get_available_actions():
             return tools
     return run_async(_get_tools())
 
+def build_formatting_prompt(action, result, username, start_date, end_date, domain):
+    """Build prompt for LLM to format unknown action results"""
+    prompt = f"""
+You are a data formatting assistant for an e-commerce analytics dashboard. 
+
+Action performed: {action}
+Domain: {domain}
+Username: {username if username else 'N/A'}
+Date range: {start_date} to {end_date}
+Raw data result: {result}
+
+Please format this data for display in a Streamlit UI. The formatting should be:
+1. User-friendly and easy to read
+2. Use markdown formatting for better presentation
+3. Include relevant emojis to make it visually appealing
+4. Structure the data logically (tables, lists, etc.)
+5. Highlight important information with bold text
+6. If the data is a list/array, format it as a readable table or bullet points
+7. If it's numerical data, format numbers appropriately (currency, percentages, etc.)
+8. Include a clear header describing what the data represents
+
+Return only the formatted markdown text without any explanations or additional commentary.
+"""
+    return prompt
+
 def format_result(result, action, username, start_date, end_date, domain):
     """Format the result for display"""
     print(f"DEBUG: format_result called with result: {result}, type: {type(result)}")
@@ -243,6 +268,7 @@ def format_result(result, action, username, start_date, end_date, domain):
     if isinstance(result, dict) and 'action' in result:
         return f"❌ Error: Received parameters instead of data: {result}"
     
+    # Known action formatting (existing logic)
     if action == "get_total_orders":
         if isinstance(result, int):
             return f"**Total Orders for {username} in {domain} from {start_date} to {end_date}:**\n\n{result}"
@@ -305,8 +331,17 @@ def format_result(result, action, username, start_date, end_date, domain):
             return sales_summary
         else:
             return f"No sales records found for users in `{domain}` in the specified date range."
-    
-    return str(result)
+    else:
+        # Unknown action - use LLM to format the result
+        print(f"DEBUG: Unknown action '{action}', using LLM for formatting")
+        try:
+            formatting_prompt = build_formatting_prompt(action, result, username, start_date, end_date, domain)
+            formatted_result = call_llm(formatting_prompt)
+            return formatted_result
+        except Exception as e:
+            print(f"DEBUG: Error formatting with LLM: {e}")
+            # Fallback to basic formatting
+            return f"**{action.replace('_', ' ').title()} Results for {domain}:**\n\n```\n{str(result)}\n```"
 
 def check_mcp_connection():
     """Check MCP server connection and get available databases"""
@@ -430,6 +465,7 @@ with st.sidebar:
     st.write("• Sales data for [username]")
     st.write("• Users and their sales details")
     st.write("• Date range: YYYY-MM-DD format")
+    st.write("• **Plus any custom MCP tools!**")
     
     st.header("💡 Example Queries")
     st.code("Show total orders for antim in testrsfp.rapidor.co from 2025-01-01 to 2025-06-30")
@@ -543,3 +579,4 @@ with st.sidebar:
 # Footer
 st.markdown("---")
 st.caption("💡 Example: 'Show total orders for antim in testrsfp.rapidor.co from 2025-01-01 to 2025-06-30'")
+st.caption("🤖 Now supports dynamic formatting for any MCP tool!")
