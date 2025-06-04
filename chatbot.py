@@ -158,7 +158,7 @@ Available databases (by domain name) are:
 {db_list_str}
 
 When a user asks a question, extract:
-- `action`: one of [get_total_orders, get_total_invoices, get_attendance, calculate_sales]
+- `action`: one of [get_total_orders, get_total_invoices, get_attendance, calculate_sales, get_leave_details, get_users_and_sales_details]
 - `domain`: the customer domain they refer to (must match one of the listed domains)
 - `username`: sales username
 - `start_date` and `end_date` in YYYY-MM-DD format
@@ -186,23 +186,60 @@ def format_result(result, action, username, start_date, end_date, domain):
         return f"❌ Error: Received parameters instead of data: {result}"
     
     if action == "get_total_orders":
-        return f"📊 **Total Orders**: {result} orders created by {username} in {domain} from {start_date} to {end_date}"
+        if isinstance(result, int):
+            return f"**Total Orders for {username} in {domain} from {start_date} to {end_date}:**\n\n{result}"
+        return str(result)
+    elif action == "get_attendance":
+        if result and isinstance(result, list):
+            attendance_summary = f"**Attendance records for {username} in {domain} from {start_date} to {end_date}:**\n\n"
+            for record in result:
+                date = record.get('date_timezone', 'N/A')
+                status = record.get('attendance_status', 'N/A')
+                message = record.get('message', '')
+                leave_status = record.get('leave_status', '')
+                leave_type = record.get('leave_type', '')
+                day = record.get('day', '')
+                attendance_summary += f"• **{date}**: {status} ({day})"
+                if message:
+                    attendance_summary += f", _{message}_"
+                if status == 'leave' and (leave_status or leave_type):
+                    attendance_summary += f" [Leave: {leave_status or ''} {leave_type or ''}]"
+                attendance_summary += "\n"
+            return attendance_summary
+        else:
+            return f"No attendance records found for {username} in the specified date range."
+    elif action == "get_leave_details":
+        if result and isinstance(result, list):
+            leave_summary = f"**Leave records for {username} in {domain} from {start_date} to {end_date}:**\n\n"
+            for record in result:
+                date = record.get('date_timezone', 'N/A')
+                leave_status = record.get('leave_status', 'N/A')
+                leave_type = record.get('leave_type', 'N/A')
+                day = record.get('day', 'N/A')
+                message = record.get('message', '')
+                leave_summary += f"• **{date}**: {leave_status} {leave_type} ({day})"
+                if message:
+                    leave_summary += f", _{message}_"
+                leave_summary += "\n"
+            return leave_summary
+        else:
+            return f"No leave records found for {username} in the specified date range."
     elif action == "get_total_invoices":
         return f"📋 **Total Invoices**: {result} invoices created by {username} in {domain} from {start_date} to {end_date}"
     elif action == "calculate_sales":
         return f"💰 **Total Sales**: ${result:,.2f} in sales by {username} in {domain} from {start_date} to {end_date}"
-    elif action == "get_attendance":
-        if isinstance(result, list) and result:
-            attendance_summary = f"👤 **Attendance for {username}** from {start_date} to {end_date}:\n\n"
+    elif action == "get_users_and_sales_details":
+        if result and isinstance(result, list):
+            sales_summary = f"**Users and Sales Details in {domain} from {start_date} to {end_date}:**\n\n"
             for record in result:
-                date = record.get('attendance_date', 'N/A')
-                status = record.get('status', 'N/A')
-                check_in = record.get('check_in', 'N/A')
-                check_out = record.get('check_out', 'N/A')
-                attendance_summary += f"• **{date}**: {status} (In: {check_in}, Out: {check_out})\n"
-            return attendance_summary
+                username = record.get('username', 'N/A')
+                first_name = record.get('first_name', '')
+                last_name = record.get('last_name', '')
+                total_sales = record.get('total_sales', 0)
+                sales_summary += f"• **{username}** ({first_name} {last_name}): ${total_sales:,.2f}\n"
+            return sales_summary
         else:
-            return f"No attendance records found for {username} in the specified date range."
+            return f"No sales records found for users in {domain} in the specified date range."
     
     return str(result)
 
@@ -334,12 +371,16 @@ with st.sidebar:
     st.write("• Total orders for [username]")
     st.write("• Total invoices for [username]")
     st.write("• Attendance for [username]")
+    st.write("• Leave details for [username]")
     st.write("• Sales data for [username]")
+    st.write("• Users and their sales details")
     st.write("• Date range: YYYY-MM-DD format")
     
     st.header("💡 Example Queries")
     st.code("Show total orders for john_doe in acme.com from 2024-01-01 to 2024-01-31")
     st.code("Get attendance for mary_smith in techcorp.com from 2024-02-01 to 2024-02-29")
+    st.code("Show leave details for mary_smith in techcorp.com from 2024-02-01 to 2024-02-29")
+    st.code("Show users and sales details in acme.com from 2024-01-01 to 2024-01-31")
 
 # Chat interface
 user_input = st.chat_input("Ask about your e-commerce data...")

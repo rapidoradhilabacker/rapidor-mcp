@@ -17,25 +17,35 @@ MASTER_DB_PORT = os.getenv("MASTER_DB_PORT")
 mcp = FastMCP("EcommerceAnalytics")
 
 def get_connection(db_name):
-    """Create database connection for an initialized DB with error handling"""
+    """Return stored psycopg2 connection for an initialized DB with error handling"""
     if db_name not in DB_CONNECTIONS:
         raise ToolError(f"Database {db_name} not initialized or not allowed.")
-    params = DB_CONNECTIONS[db_name]
-    try:
-        return psycopg2.connect(
-            dbname=db_name,
-            user=MASTER_DB_USER,
-            password=MASTER_DB_PASSWORD,
-            host=MASTER_DB_HOST,
-            port=MASTER_DB_PORT,
-            cursor_factory=RealDictCursor,
-        )
-    except psycopg2.Error as e:
-        raise ToolError(f"Database connection error: {e}")
+    conn = DB_CONNECTIONS[db_name].get("connection")
+    if conn is None:
+        raise ToolError(f"No connection found for database {db_name}.")
+    # Optionally check if connection is closed and reconnect if needed
+    if conn.closed:
+        try:
+            conn = psycopg2.connect(
+                dbname=db_name,
+                user=MASTER_DB_USER,
+                password=MASTER_DB_PASSWORD,
+                host=MASTER_DB_HOST,
+                port=MASTER_DB_PORT,
+                cursor_factory=RealDictCursor,
+            )
+            DB_CONNECTIONS[db_name]["connection"] = conn
+        except psycopg2.Error as e:
+            raise ToolError(f"Database reconnection error: {e}")
+    return conn
 
 @mcp.tool()
 def list_databases() -> list[dict]:
-    """List all available initialized customer databases"""
+    """
+    List all available initialized customer databases
+    Returns:
+        list[dict]: List of initialized DBs and their domains
+    """
     # Return the list of initialized DBs and their domains
     return [
         {"db_name": db_name, "domain": DB_CONNECTIONS[db_name]["domain"]}
@@ -49,7 +59,16 @@ def get_total_orders(
     start_date: str,
     end_date: str,
 ) -> int:
-    """Get total orders count for a user within date range (initialized DBs only)"""
+    """
+    Get total orders count for a user within date range (initialized DBs only)
+    Args:
+        db_name (str): Name of the database
+        username (str): Username of the user
+        start_date (str): Start date of the date range
+        end_date (str): End date of the date range
+    Returns:
+        int: Total orders count for the user within the date range
+    """
     try:
         print("Starting get_total_orders")
         conn = get_connection(db_name)
@@ -75,7 +94,16 @@ def get_total_invoices(
     start_date: str,
     end_date: str,
 ) -> int:
-    """Get total invoices count for a user within date range (initialized DBs only)"""
+    """
+    Get total invoices count for a user within date range (initialized DBs only)
+    Args:
+        db_name (str): Name of the database
+        username (str): Username of the user
+        start_date (str): Start date of the date range
+        end_date (str): End date of the date range
+    Returns:
+        int: Total invoices count for the user within the date range
+    """
     try:
         print("Starting get_total_invoices")
         conn = get_connection(db_name)
@@ -101,24 +129,69 @@ def get_attendance(
     start_date: str,
     end_date: str,
 ) -> list[dict]:
-    """Get attendance records for a user within date range (initialized DBs only)"""
+    """
+    Get attendance records for a user within date range from user_role_userattendance table.
+    Args:
+        db_name (str): Name of the database
+        username (str): Username of the user
+        start_date (str): Start date of the date range (YYYY-MM-DD)
+        end_date (str): End date of the date range (YYYY-MM-DD)
+    Returns:
+        list[dict]: Attendance records for the user within the date range
+    """
     try:
-        print("Starting get_attendance")
+        print("Starting get_attendance (user_role_userattendance)")
         conn = get_connection(db_name)
         cur = conn.cursor()
         sql = '''
-            SELECT at.date AS attendance_date, at.status, at.check_in, at.check_out
-            FROM attendance_attendancelog at
-            JOIN auth_user au ON at.user_id = au.id
-            WHERE au.username = %s AND at.date BETWEEN %s AND %s
-            ORDER BY at.date;
+            SELECT username, owner_fullname, date_timezone, created_on, attendance_status, message, leave_status, leave_type, day
+            FROM user_role_userattendance
+            WHERE username = %s AND date_timezone BETWEEN %s AND %s
+            ORDER BY date_timezone;
         '''
         cur.execute(sql, (username, start_date, end_date))
+        columns = [desc[0] for desc in cur.description]
         rows = cur.fetchall()
         conn.close()
-        return [dict(row) for row in rows]
+        return [dict(zip(columns, row)) for row in rows]
     except Exception as e:
         raise ToolError(f"Error fetching attendance: {e}")
+
+@mcp.tool()
+def get_leave_details(
+    db_name: str,
+    username: str,
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    """
+    Get leave details for a user within a date range from user_role_userattendance table.
+    Args:
+        db_name (str): Name of the database
+        username (str): Username of the user
+        start_date (str): Start date of the date range (YYYY-MM-DD)
+        end_date (str): End date of the date range (YYYY-MM-DD)
+    Returns:
+        list[dict]: Leave records for the user within the date range
+    """
+    try:
+        print("Starting get_leave_details (user_role_userattendance)")
+        conn = get_connection(db_name)
+        cur = conn.cursor()
+        sql = '''
+            SELECT username, owner_fullname, date_timezone, created_on, attendance_status, message, leave_status, leave_type, day
+            FROM user_role_userattendance
+            WHERE username = %s AND date_timezone BETWEEN %s AND %s AND attendance_status = 'leave'
+            ORDER BY date_timezone;
+        '''
+        cur.execute(sql, (username, start_date, end_date))
+        columns = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        raise ToolError(f"Error fetching leave details: {e}")
+
 
 @mcp.tool()
 def calculate_sales(
@@ -127,7 +200,16 @@ def calculate_sales(
     start_date: str,
     end_date: str,
 ) -> float:
-    """Calculate total sales for a user within date range (initialized DBs only)"""
+    """
+    Calculate total sales for a user within date range (initialized DBs only)
+    Args:
+        db_name (str): Name of the database
+        username (str): Username of the user
+        start_date (str): Start date of the date range
+        end_date (str): End date of the date range
+    Returns:
+        float: Total sales for the user within the date range
+    """
     try:
         print("Starting calculate_sales")
         conn = get_connection(db_name)
@@ -146,9 +228,46 @@ def calculate_sales(
     except Exception as e:
         raise ToolError(f"Error fetching total sales: {e}")
 
+@mcp.tool()
+def get_users_and_sales_details(
+    db_name: str,
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    """
+    Get users and their sales details within a date range from order_fullorder table.
+    Args:
+        db_name (str): Name of the database
+        start_date (str): Start date of the date range (YYYY-MM-DD)
+        end_date (str): End date of the date range (YYYY-MM-DD)
+    Returns:
+        list[dict]: Users and their sales details within the date range
+    """
+    try:
+        print("Starting get_users_and_sales_details")
+        conn = get_connection(db_name)
+        cur = conn.cursor()
+        sql = '''
+            SELECT au.username, au.first_name, au.last_name, SUM(fo.order_grand_total) AS total_sales
+            FROM auth_user au
+            JOIN order_fullorder fo ON au.id = fo."createdBy_id"
+            WHERE fo."createdOn" BETWEEN %s::timestamp AND %s::timestamp
+            GROUP BY au.username, au.first_name, au.last_name;
+        '''
+        cur.execute(sql, (start_date, end_date))
+        columns = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        raise ToolError(f"Error fetching users and sales details: {e}")
+
 # --- Initialize DB_CONNECTIONS for INITIALIZED_DBS ---
 DB_CONNECTIONS = {}
 try:
+    """
+    Initialize DB_CONNECTIONS for INITIALIZED_DBS with both domain and psycopg2 connection
+    """
     master_conn = psycopg2.connect(
         dbname=MASTER_DB_NAME,
         user=MASTER_DB_USER,
@@ -161,9 +280,24 @@ try:
     sql = 'SELECT "database" AS db_name, domain FROM customer_customer WHERE "database" = ANY(%s)'
     master_cur.execute(sql, (INITIALIZED_DBS,))
     for row in master_cur.fetchall():
-        DB_CONNECTIONS[row["db_name"]] = {
-            "domain": row["domain"]
-        }
+        db_name = row["db_name"]
+        domain = row["domain"]
+        try:
+            conn = psycopg2.connect(
+                dbname=db_name,
+                user=MASTER_DB_USER,
+                password=MASTER_DB_PASSWORD,
+                host=MASTER_DB_HOST,
+                port=MASTER_DB_PORT,
+                cursor_factory=RealDictCursor,
+                connect_timeout=60,
+            )
+            DB_CONNECTIONS[db_name] = {
+                "domain": domain,
+                "connection": conn
+            }
+        except Exception as conn_e:
+            print(f"Error connecting to DB {db_name}: {conn_e}")
     master_conn.close()
 except Exception as e:
     print(f"Error initializing DB_CONNECTIONS: {e}")
