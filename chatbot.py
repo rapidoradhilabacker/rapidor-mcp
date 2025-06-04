@@ -7,8 +7,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
 import google.generativeai as genai
-from fastmcp import Client
-from mcp.types import TextContent, ImageContent, EmbeddedResource
+
+# MCP imports
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 load_dotenv(dotenv_path='.env')
 
@@ -38,66 +40,105 @@ def call_llm(prompt):
     else:
         raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
 
-class AsyncMCPClient:
-    def __init__(self, server_url="http://localhost:8087/sse"):
-        self.server_url = server_url
-        self._client = None
+class MCPClient:
+    def __init__(self, server_script_path="server.py"):
+        self.server_script_path = server_script_path
+        self.session = None
+        self.available_tools = []
+        self.stdio_transport = None
+        self.read_stream = None
+        self.write_stream = None
     
     async def __aenter__(self):
         """Async context manager entry"""
-        self._client = Client(self.server_url)
-        await self._client.__aenter__()
+        # Create server parameters for stdio connection
+        server_params = StdioServerParameters(
+            command="python",
+            args=[self.server_script_path],
+            env=None
+        )
+        
+        # Create stdio client and session
+        self.stdio_transport = stdio_client(server_params)
+        self.read_stream, self.write_stream = await self.stdio_transport.__aenter__()
+        
+        # Create client session
+        self.session = ClientSession(self.read_stream, self.write_stream)
+        await self.session.__aenter__()
+        
+        # Add retry logic for initialization
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Initialize the session
+                await self.session.initialize()
+                
+                # Get available tools
+                tools_result = await self.session.list_tools()
+                self.available_tools = tools_result.tools
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise Exception(f"Failed to initialize MCP session after {max_retries} attempts: {e}")
+                await asyncio.sleep(1)  # Wait before retry
+        
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
-        if self._client:
-            await self._client.__aexit__(exc_type, exc_val, exc_tb)
+        try:
+            if self.session:
+                await self.session.__aexit__(exc_type, exc_val, exc_tb)
+        except Exception as e:
+            print(f"DEBUG: Error closing session: {e}")
+        
+        try:
+            if self.stdio_transport:
+                await self.stdio_transport.__aexit__(exc_type, exc_val, exc_tb)
+        except Exception as e:
+            print(f"DEBUG: Error closing transport: {e}")
     
     async def list_tools(self):
         """List available tools"""
-        if not self._client:
+        if not self.session:
             raise RuntimeError("Client not initialized. Use async context manager.")
-        return await self._client.list_tools()
+        return self.available_tools
     
-    async def call_tool(self, tool_name, params):
-        """Call MCP tool via fastmcp client"""
-        if not self._client:
+    async def call_tool(self, tool_name, arguments):
+        """Call MCP tool via stdio client session"""
+        if not self.session:
             raise RuntimeError("Client not initialized. Use async context manager.")
         
         try:
-            print(f"DEBUG: Calling tool '{tool_name}' with params: {params}")  # DEBUG
-            result = await self._client.call_tool(tool_name, params)
-            print(f"DEBUG: Raw MCP result type: {type(result)}")  # DEBUG
-            print(f"DEBUG: Raw MCP result: {result}")  # DEBUG
+            print(f"DEBUG: Calling tool '{tool_name}' with arguments: {arguments}")
+            result = await self.session.call_tool(tool_name, arguments)
+            print(f"DEBUG: Raw MCP result: {result}")
             
             extracted = self._extract_content(result)
-            print(f"DEBUG: Extracted content: {extracted}")  # DEBUG
+            print(f"DEBUG: Extracted content: {extracted}")
             return extracted
         except Exception as e:
-            print(f"DEBUG: MCP call exception: {e}")  # DEBUG
+            print(f"DEBUG: MCP call exception: {e}")
             raise Exception(f"MCP call failed: {e}")
     
     def _extract_content(self, result):
-        """Extract content from MCP response types"""
-        print(f"DEBUG: _extract_content input type: {type(result)}")  # DEBUG
-        print(f"DEBUG: _extract_content input: {result}")  # DEBUG
+        """Extract content from MCP response"""
+        print(f"DEBUG: _extract_content input type: {type(result)}")
+        print(f"DEBUG: _extract_content input: {result}")
         
-        if isinstance(result, list):
+        # Handle CallToolResult
+        if hasattr(result, 'content') and result.content:
             content_parts = []
-            for item in result:
-                if isinstance(item, ImageContent):
-                    content_parts.append(item.data)
-                elif isinstance(item, EmbeddedResource):
-                    content_parts.append(item.resource)
-                elif isinstance(item, TextContent):
+            for item in result.content:
+                if hasattr(item, 'text'):
                     content_parts.append(item.text)
+                elif hasattr(item, 'data'):
+                    content_parts.append(str(item.data))
                 else:
-                    # Handle other types
                     content_parts.append(str(item))
             
             final_content = '\n'.join(content_parts) if content_parts else str(result)
-            print(f"DEBUG: Final extracted content: {final_content}")  # DEBUG
+            print(f"DEBUG: Final extracted content: {final_content}")
             return final_content
         
         return str(result)
@@ -117,39 +158,43 @@ def call_mcp_tool_sync(tool_name, db_name, username, start_date, end_date):
     """Synchronous wrapper for MCP tool calls"""
     async def _call_mcp_tool():
         try:
-            async with AsyncMCPClient() as mcp_client:
-                params = {
+            async with MCPClient() as mcp_client:
+                arguments = {
                     "db_name": db_name,
                     "username": username,
                     "start_date": start_date,
                     "end_date": end_date,
                 }
                 
-                print(f"DEBUG: About to call MCP tool with params: {params}")  # DEBUG
-                result = await mcp_client.call_tool(tool_name, params)
-                print(f"DEBUG: MCP tool returned: {result}")  # DEBUG
+                # Remove username for tools that don't need it
+                if tool_name == "get_users_and_sales_details":
+                    arguments.pop("username", None)
+                
+                print(f"DEBUG: About to call MCP tool with arguments: {arguments}")
+                result = await mcp_client.call_tool(tool_name, arguments)
+                print(f"DEBUG: MCP tool returned: {result}")
                 
                 # Parse result if it's a JSON string
                 if isinstance(result, str):
                     try:
                         parsed = json.loads(result)
-                        print(f"DEBUG: Successfully parsed JSON: {parsed}")  # DEBUG
+                        print(f"DEBUG: Successfully parsed JSON: {parsed}")
                         return parsed
                     except json.JSONDecodeError as e:
-                        print(f"DEBUG: JSON parse error: {e}")  # DEBUG
+                        print(f"DEBUG: JSON parse error: {e}")
                         return result
                 
                 return result
                 
         except Exception as e:
             error_msg = f"Error calling MCP tool: {e}"
-            print(f"DEBUG: {error_msg}")  # DEBUG
+            print(f"DEBUG: {error_msg}")
             return error_msg
     
     return run_async(_call_mcp_tool())
 
-def build_prompt(user_message, db_options):
-    """Build prompt for OpenAI to parse user intent"""
+def build_prompt(user_message, db_options, available_actions):
+    """Build prompt for LLM to parse user intent"""
     db_list_str = "\n".join([f"- {d}" for d in db_options])
     prompt = f"""
 You are an e-commerce analytics assistant. Users will ask about total orders, invoices, attendance, or sales for a sales user in a given date range. 
@@ -157,10 +202,12 @@ You are an e-commerce analytics assistant. Users will ask about total orders, in
 Available databases (by domain name) are:
 {db_list_str}
 
+Available actions are: {', '.join(available_actions)}
+
 When a user asks a question, extract:
-- `action`: one of [get_total_orders, get_total_invoices, get_attendance, calculate_sales, get_leave_details, get_users_and_sales_details]
+- `action`: one of {available_actions}
 - `domain`: the customer domain they refer to (must match one of the listed domains)
-- `username`: sales username
+- `username`: sales username (not required for get_users_and_sales_details)
 - `start_date` and `end_date` in YYYY-MM-DD format
 
 If the user doesn't specify a domain, prompt them to choose from the list.
@@ -174,9 +221,20 @@ User query: "{user_message}"
 """
     return prompt
 
+def get_available_actions():
+    async def _get_tools():
+        async with MCPClient() as mcp_client:
+            tools = await mcp_client.list_tools()
+            # tools can be Tool objects or strings depending on implementation
+            # If Tool objects, extract .name
+            if tools and hasattr(tools[0], 'name'):
+                return [tool.name for tool in tools]
+            return tools
+    return run_async(_get_tools())
+
 def format_result(result, action, username, start_date, end_date, domain):
     """Format the result for display"""
-    print(f"DEBUG: format_result called with result: {result}, type: {type(result)}")  # DEBUG
+    print(f"DEBUG: format_result called with result: {result}, type: {type(result)}")
     
     if isinstance(result, str) and result.startswith("Error"):
         return result
@@ -229,33 +287,50 @@ def format_result(result, action, username, start_date, end_date, domain):
     elif action == "calculate_sales":
         return f"💰 **Total Sales**: ${result:,.2f} in sales by {username} in {domain} from {start_date} to {end_date}"
     elif action == "get_users_and_sales_details":
-        if result and isinstance(result, list):
-            sales_summary = f"**Users and Sales Details in {domain} from {start_date} to {end_date}:**\n\n"
+        if result and isinstance(result, list) and len(result) > 0:
+            sales_summary = f"**Users and Sales Details in `{domain}` from `{start_date}` to `{end_date}`:**\n\n"
+            # Markdown table header
+            sales_summary += "| Username | First Name | Last Name | Total Sales ($) |\n"
+            sales_summary += "|---|---|---|---:|\n"
             for record in result:
-                username = record.get('username', 'N/A')
+                username_val = record.get('username', 'N/A')
                 first_name = record.get('first_name', '')
                 last_name = record.get('last_name', '')
                 total_sales = record.get('total_sales', 0)
-                sales_summary += f"• **{username}** ({first_name} {last_name}): ${total_sales:,.2f}\n"
+                try:
+                    total_sales_float = float(total_sales)
+                except (ValueError, TypeError):
+                    total_sales_float = 0.0
+                sales_summary += f"| {username_val} | {first_name} | {last_name} | {total_sales_float:,.2f} |\n"
             return sales_summary
         else:
-            return f"No sales records found for users in {domain} in the specified date range."
+            return f"No sales records found for users in `{domain}` in the specified date range."
     
     return str(result)
 
 def check_mcp_connection():
-    """Check MCP server connection and transform response content types."""
+    """Check MCP server connection and get available databases"""
     async def _check_connection():
         try:
-            async with AsyncMCPClient() as mcp_client:
+            # Add delay to allow server to start
+            await asyncio.sleep(2)
+            
+            async with MCPClient() as mcp_client:
                 # Try to list tools as a connection test
                 tools = await mcp_client.list_tools()
-                print(f"DEBUG: Available tools: {tools}")  # DEBUG
-                # Also try to fetch databases
-                result = await mcp_client.call_tool("list_databases", {})
+                print(f"DEBUG: Available tools: {[tool.name for tool in tools]}")
+                
+                # Try to fetch databases with timeout
+                result = await asyncio.wait_for(
+                    mcp_client.call_tool("list_databases", {}),
+                    timeout=10.0  # 10 second timeout
+                )
                 return True, result
+        except asyncio.TimeoutError:
+            print("DEBUG: Connection check timed out")
+            return False, "Connection timeout - server may not be ready"
         except Exception as e:
-            print(f"DEBUG: Connection check failed: {e}")  # DEBUG
+            print(f"DEBUG: Connection check failed: {e}")
             return False, str(e)
     
     return run_async(_check_connection())
@@ -277,24 +352,23 @@ if 'history' not in st.session_state:
 # Check MCP server connection
 try:
     connected, db_result = check_mcp_connection()
-    print(f"DEBUG: Connection status: {connected}, db_result: {db_result}")  # DEBUG
+    print(f"DEBUG: Connection status: {connected}, db_result: {db_result}")
 except Exception as e:
     connected, db_result = False, str(e)
-    print(f"DEBUG: Connection exception: {e}")  # DEBUG
+    print(f"DEBUG: Connection exception: {e}")
 
 if not connected:
     st.error(f"⚠️ Cannot connect to MCP server: {db_result}")
-    st.info("Make sure your MCP server is running and accessible via SSE at the configured URL")
+    st.info("Make sure your MCP server is running. The server should be started as a separate Python process.")
     
     # Add information about server setup
     with st.expander("🔧 Server Setup Instructions"):
         st.code("""
-# Make sure your MCP server supports SSE endpoint
-# Example server URL: http://localhost:8087/sse
-# If using a Python script as MCP server:
-# You can also connect directly to the script file
-# async with Client("server.py") as client:
-#     ...
+            # Start the MCP server in a separate terminal:
+            python server.py
+
+            # The server runs as a stdio-based MCP server
+            # The chatbot connects to it via subprocess
         """)
     
     # Add button to start server (if applicable)
@@ -312,47 +386,28 @@ db_map = {}
 
 def parse_mcp_result(db_result):
     """Parse MCP result to extract database information"""
-    print(f"DEBUG: parse_mcp_result input: {db_result}, type: {type(db_result)}")  # DEBUG
+    print(f"DEBUG: parse_mcp_result input: {db_result}, type: {type(db_result)}")
     
     if isinstance(db_result, str):
         try:
             parsed = json.loads(db_result)
-            print(f"DEBUG: Successfully parsed string as JSON: {parsed}")  # DEBUG
+            print(f"DEBUG: Successfully parsed string as JSON: {parsed}")
             return parsed
         except json.JSONDecodeError as e:
-            print(f"DEBUG: Failed to parse string as JSON: {e}")  # DEBUG
-            return None
-    elif hasattr(db_result, 'content') and db_result.content:
-        # Handle MCP response types
-        if isinstance(db_result.content, list):
-            for item in db_result.content:
-                if hasattr(item, 'text'):
-                    try:
-                        parsed = json.loads(item.text)
-                        print(f"DEBUG: Successfully parsed content text as JSON: {parsed}")  # DEBUG
-                        return parsed
-                    except json.JSONDecodeError:
-                        continue
-        return None
-    elif hasattr(db_result, 'text'):
-        try:
-            parsed = json.loads(db_result.text)
-            print(f"DEBUG: Successfully parsed text attribute as JSON: {parsed}")  # DEBUG
-            return parsed
-        except json.JSONDecodeError:
+            print(f"DEBUG: Failed to parse string as JSON: {e}")
             return None
     
-    print(f"DEBUG: Returning db_result as-is: {db_result}")  # DEBUG
+    print(f"DEBUG: Returning db_result as-is: {db_result}")
     return db_result
 
 if connected:
     parsed_result = parse_mcp_result(db_result)
-    print(f"DEBUG: Parsed database result: {parsed_result}")  # DEBUG
+    print(f"DEBUG: Parsed database result: {parsed_result}")
     
     if isinstance(parsed_result, list):
         try:
             db_map = {row['domain']: row['db_name'] for row in parsed_result if isinstance(row, dict) and 'domain' in row and 'db_name' in row}
-            print(f"DEBUG: Created db_map: {db_map}")  # DEBUG
+            print(f"DEBUG: Created db_map: {db_map}")
         except (KeyError, TypeError) as e:
             st.error(f"Error parsing database list: {e}")
             db_map = {}
@@ -377,10 +432,10 @@ with st.sidebar:
     st.write("• Date range: YYYY-MM-DD format")
     
     st.header("💡 Example Queries")
-    st.code("Show total orders for john_doe in acme.com from 2024-01-01 to 2024-01-31")
-    st.code("Get attendance for mary_smith in techcorp.com from 2024-02-01 to 2024-02-29")
-    st.code("Show leave details for mary_smith in techcorp.com from 2024-02-01 to 2024-02-29")
-    st.code("Show users and sales details in acme.com from 2024-01-01 to 2024-01-31")
+    st.code("Show total orders for antim in testrsfp.rapidor.co from 2025-01-01 to 2025-06-30")
+    st.code("Get attendance for antim in testrsfp.rapidor.co from 2025-01-01 to 2025-06-30")
+    st.code("Show leave details for antim in testrsfp.rapidor.co from 2025-01-01 to 2025-06-30")
+    st.code("Show Users and their sales details in testrsfp.rapidor.co from 2025-01-01 to 2025-06-30")
 
 # Chat interface
 user_input = st.chat_input("Ask about your e-commerce data...")
@@ -388,14 +443,16 @@ user_input = st.chat_input("Ask about your e-commerce data...")
 if user_input:
     # Add user message to history
     st.session_state.history.append({"role": "user", "content": user_input})
-    print(f"DEBUG: User input: {user_input}")  # DEBUG
+    print(f"DEBUG: User input: {user_input}")
     
-    # Parse user intent with OpenAI
-    prompt = build_prompt(user_input, list(db_map.keys()))
+    # Fetch available actions from MCP client
+    available_actions = get_available_actions()
+    # Parse user intent with LLM
+    prompt = build_prompt(user_input, list(db_map.keys()), available_actions)
     
     try:
         content = call_llm(prompt)
-        print(f"DEBUG: LLM response: {content}")  # DEBUG
+        print(f"DEBUG: LLM response: {content}")
         
         # Try to parse JSON response
         try:
@@ -414,9 +471,9 @@ if user_input:
                     clean_content = '\n'.join(lines[1:-1])  # Remove first and last line
                 clean_content = clean_content.strip()
             
-            print(f"DEBUG: Cleaned LLM content: {clean_content}")  # DEBUG
+            print(f"DEBUG: Cleaned LLM content: {clean_content}")
             params = json.loads(clean_content)
-            print(f"DEBUG: Parsed LLM params: {params}")  # DEBUG
+            print(f"DEBUG: Parsed LLM params: {params}")
             
             action = params.get("action")
             domain = params.get("domain")
@@ -425,28 +482,33 @@ if user_input:
             end_date = params.get("end_date")
             
             # Validate required parameters
-            if not all([action, domain, username, start_date, end_date]):
-                missing = [k for k, v in params.items() if not v]
-                reply = f"❌ Missing required information: {', '.join(missing)}. Please provide all details."
+            required_params = ["action", "domain", "start_date", "end_date"]
+            if action != "get_users_and_sales_details":
+                required_params.append("username")
+            
+            missing_params = [param for param in required_params if not params.get(param)]
+            
+            if missing_params:
+                reply = f"❌ Missing required information: {', '.join(missing_params)}. Please provide all details."
             elif domain not in db_map:
                 reply = f"❌ Unknown domain `{domain}`. Available domains: {', '.join(db_map.keys())}"
             else:
                 # Call MCP tool
                 db_name = db_map[domain]
-                print(f"DEBUG: Using db_name: {db_name} for domain: {domain}")  # DEBUG
+                print(f"DEBUG: Using db_name: {db_name} for domain: {domain}")
                 
                 with st.spinner(f"Fetching {action} data..."):
                     result = call_mcp_tool_sync(action, db_name, username, start_date, end_date)
-                    print(f"DEBUG: Final result from MCP: {result}")  # DEBUG
+                    print(f"DEBUG: Final result from MCP: {result}")
                     reply = format_result(result, action, username, start_date, end_date, domain)
                 
         except json.JSONDecodeError as e:
-            print(f"DEBUG: JSON decode error: {e}")  # DEBUG
-            reply = content  # OpenAI couldn't parse - likely an error message
+            print(f"DEBUG: JSON decode error: {e}")
+            reply = content  # LLM couldn't parse - likely an error message
             
     except Exception as e:
         error_msg = f"❌ Error processing request: {e}"
-        print(f"DEBUG: Processing error: {e}")  # DEBUG
+        print(f"DEBUG: Processing error: {e}")
         reply = error_msg
     
     # Add assistant response to history
@@ -480,4 +542,4 @@ with st.sidebar:
 
 # Footer
 st.markdown("---")
-st.caption("💡 Example: 'Show total orders for john_doe in acme.com from 2024-01-01 to 2024-01-31'")
+st.caption("💡 Example: 'Show total orders for antim in testrsfp.rapidor.co from 2025-01-01 to 2025-06-30'")
