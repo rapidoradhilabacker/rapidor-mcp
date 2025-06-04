@@ -43,20 +43,13 @@ This project is an end-to-end analytics solution for e-commerce platforms, featu
      - LLM: `OPENAI_API_KEY` **or** `GEMINI_API_KEY`
      - LLM selection: `LLM_PROVIDER` (set to `openai` or `gemini`)
 
-### 3. Running the Application
-**A. Start the MCP Backend Server**
+**A. Start the Streamlit Chatbot UI**
 ```bash
-python server.py
-```
-This will initialize database connections and expose analytics tools via MCP.
-
-**B. Start the Streamlit Chatbot UI**
-```bash
-streamlit run chatbot.py
+streamlit run chatbot.py --server.port 8080
 ```
 This launches a browser-based chat interface (typically at http://localhost:8501).
 
-### 4. Usage
+### Usage
 - Ask analytics questions in natural language (e.g., "Show total sales for john in acmeco.com from 2025-01-01 to 2025-01-31").
 - The chatbot will extract intent, call the backend, and present the results.
 - Supports queries for orders, invoices, attendance, leave, total sales, and user sales details.
